@@ -236,23 +236,40 @@ const CACHE_NAME = "adkiosk-media-v1";
 
 async function getCachedUrl(remoteUrl) {
   if (!remoteUrl || !remoteUrl.startsWith("http")) return remoteUrl;
+
+  const TIMEOUT_MS = 4000;
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Cache timeout")), TIMEOUT_MS)
+  );
+
   try {
-    const cache = await caches.open(CACHE_NAME);
-    const cached = await cache.match(remoteUrl);
-    if (cached) {
-      const blob = await cached.blob();
-      return URL.createObjectURL(blob);
-    }
-    const response = await fetch(remoteUrl);
-    if (response.ok) {
-      await cache.put(remoteUrl, response.clone());
-      const blob = await response.blob();
-      return URL.createObjectURL(blob);
-    }
+    const cacheWork = async () => {
+      const cache = await caches.open(CACHE_NAME);
+      const cached = await cache.match(remoteUrl);
+      if (cached) {
+        const blob = await cached.blob();
+        return URL.createObjectURL(blob);
+      }
+      const response = await fetch(remoteUrl);
+      if (response.ok) {
+        try {
+          await cache.put(remoteUrl, response.clone());
+        } catch (quotaErr) {
+          // QuotaExceededError u otro error de escritura — devolver URL remota
+          console.warn("Cache write failed (quota?), usando URL remota:", quotaErr);
+          return remoteUrl;
+        }
+        const blob = await response.blob();
+        return URL.createObjectURL(blob);
+      }
+      return remoteUrl;
+    };
+
+    return await Promise.race([cacheWork(), timeoutPromise]);
   } catch (e) {
-    console.warn("Cache error, usando URL remota:", e);
+    console.warn("Cache error o timeout, usando URL remota:", e);
+    return remoteUrl;
   }
-  return remoteUrl;
 }
 
 async function removeCachedUrl(remoteUrl) {
@@ -290,6 +307,8 @@ function KioskView({ items, onExit }) {
   const startTimeRef = useRef(null);
   const pausedAtRef = useRef(0);
   const blobUrlsRef = useRef([]);
+  // Referencia al blob activo para revocarlo antes de cargar el siguiente
+  const activeBlobRef = useRef(null);
 
   const current = items[idx];
   const isVideo = current?.type === "video";
@@ -316,6 +335,26 @@ function KioskView({ items, onExit }) {
     loadAll();
     return () => { cancelled = true; };
   }, [items]);
+
+  // Gestión agresiva de memoria: revocar blob anterior antes de cargar el siguiente
+  const currentUrl = resolveUrl(current);
+  useEffect(() => {
+    const previousBlob = activeBlobRef.current;
+    if (previousBlob && previousBlob !== currentUrl && previousBlob.startsWith("blob:")) {
+      try { URL.revokeObjectURL(previousBlob); } catch (e) { }
+    }
+    if (currentUrl && currentUrl.startsWith("blob:")) {
+      activeBlobRef.current = currentUrl;
+    } else {
+      activeBlobRef.current = null;
+    }
+    return () => {
+      if (activeBlobRef.current && activeBlobRef.current.startsWith("blob:")) {
+        try { URL.revokeObjectURL(activeBlobRef.current); } catch (e) { }
+        activeBlobRef.current = null;
+      }
+    };
+  }, [currentUrl]);
 
   useEffect(() => {
     return () => {
@@ -592,29 +631,40 @@ function KioskView({ items, onExit }) {
     </div>
   );
 
-  const currentUrl = resolveUrl(current);
-
   return (
     <div style={{ position: "fixed", inset: 0, width: "100vw", height: "100vh", background: "#000", zIndex: 99999, overflow: "hidden", margin: 0, padding: 0 }}>
       {isVideo ? (
         <video
-          key={currentUrl}
+          key={current.url}
           ref={(el) => { videoRef.current = el; forceSize(el); }}
           src={currentUrl}
           autoPlay
+          muted
           playsInline
           preload="auto"
           onLoadedMetadata={onMediaLoad}
           onCanPlay={() => { if (!initialLoadDone.current) { initialLoadDone.current = true; setIsLoading(false); } }}
+          onError={(e) => {
+            if (current?.url && e.target.src !== current.url) {
+              console.warn("Video blob error, usando URL remota:", current.url);
+              e.target.src = current.url;
+            }
+          }}
         />
       ) : (
         <img
-          key={currentUrl}
+          key={current.url}
           ref={(el) => { imgRef.current = el; forceSize(el); }}
           src={currentUrl}
           alt={current.title}
           draggable={false}
           onLoad={onMediaLoad}
+          onError={(e) => {
+            if (current?.url && e.target.src !== current.url) {
+              console.warn("Img blob error, usando URL remota:", current.url);
+              e.target.src = current.url;
+            }
+          }}
         />
       )}
 
