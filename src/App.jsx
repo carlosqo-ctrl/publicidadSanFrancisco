@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const STORAGE_BUCKET = "media";
+
+const CLOUDINARY_CLOUD = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_PRESET = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
+const SUPABASE_MAX = 45 * 1024 * 1024;
 
 const LS_KEY = "adkiosk_cache";
 
@@ -18,61 +20,6 @@ function readCache() {
     return null;
   }
 }
-const ffmpeg = new FFmpeg();
-let ffmpegLoaded = false;
-
-async function loadFFmpeg(onProgress) {
-  if (ffmpegLoaded) return;
-  onProgress?.("Cargando compresor...");
-  await ffmpeg.load({
-    coreURL: await toBlobURL(
-      'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
-      'text/javascript'
-    ),
-    wasmURL: await toBlobURL(
-      'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
-      'application/wasm'
-    ),
-  });
-  ffmpegLoaded = true;
-}
-
-// Límite en bytes (45 MB con margen de seguridad)
-const SUPABASE_MAX = 45 * 1024 * 1024;
-
-async function compressVideo(file, onProgress) {
-  await loadFFmpeg(onProgress);
-
-  onProgress?.("Comprimiendo video...");
-
-  ffmpeg.on('progress', ({ progress }) => {
-    onProgress?.(`Comprimiendo... ${Math.round(progress * 100)}%`);
-  });
-
-  await ffmpeg.writeFile('input.mp4', await fetchFile(file));
-
-  await ffmpeg.exec([
-    '-i', 'input.mp4',
-    '-vcodec', 'libx264',
-    '-crf', '28',
-    '-preset', 'fast',
-    '-vf', 'scale=-2:720',
-    '-acodec', 'aac',
-    '-b:a', '128k',
-    '-movflags', '+faststart',
-    'output.mp4'
-  ]);
-
-  const data = await ffmpeg.readFile('output.mp4');
-  await ffmpeg.deleteFile('input.mp4');
-  await ffmpeg.deleteFile('output.mp4');
-
-  return new File(
-    [new Blob([data.buffer], { type: 'video/mp4' })],
-    file.name.replace(/\.[^.]+$/, '_compressed.mp4'),
-    { type: 'video/mp4' }
-  );
-}
 
 function writeCache(items, settings, version) {
   try {
@@ -83,77 +30,76 @@ function writeCache(items, settings, version) {
 }
 
 let supabase = null;
-
 try {
   if (SUPABASE_URL !== "https://TU_PROYECTO.supabase.co") {
     supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   }
 } catch (e) { }
 
+// ── Cloudinary: subir ──────────────────────────────────────
+async function uploadToCloudinary(file, onProgress) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("upload_preset", CLOUDINARY_PRESET);
+  formData.append("resource_type", "video");
+
+  const xhr = new XMLHttpRequest();
+  return new Promise((resolve, reject) => {
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      const data = JSON.parse(xhr.responseText);
+      if (data.secure_url) resolve(data.secure_url);
+      else reject(new Error(data.error?.message || "Error en Cloudinary"));
+    };
+    xhr.onerror = () => reject(new Error("Error de red"));
+    xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/video/upload`);
+    xhr.send(formData);
+  });
+}
+
+// ── Cloudinary: extraer public_id de la URL ────────────────
+function extractCloudinaryPublicId(url) {
+  try {
+    const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[^.]+$/);
+    return match ? match[1] : null;
+  } catch { return null; }
+}
+
+// ── Cloudinary: borrar via Edge Function de Supabase ───────
+async function deleteFromCloudinary(url) {
+  const public_id = extractCloudinaryPublicId(url);
+  if (!public_id || !supabase) return;
+
+  await supabase.functions.invoke("delete-cloudinary", {
+    body: { public_id },
+  });
+}
+
 const style = `
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
   html, body { overflow-x: hidden; max-width: 100%; }
-
   :root {
-    --bg: #0a0a0f;
-    --surface: #13131a;
-    --surface2: #1c1c28;
-    --border: #2a2a3d;
-    --accent: #6c63ff;
-    --accent2: #ff6584;
-    --text: #e8e8f0;
-    --text-dim: #7070a0;
-    --success: #43d9a0;
-    --warning: #ffb347;
-    --danger: #ff5f7e;
+    --bg: #0a0a0f; --surface: #13131a; --surface2: #1c1c28;
+    --border: #2a2a3d; --accent: #6c63ff; --accent2: #ff6584;
+    --text: #e8e8f0; --text-dim: #7070a0; --success: #43d9a0;
+    --warning: #ffb347; --danger: #ff5f7e;
   }
-
-  .swr-badge {
-    font-size: 10px;
-    background: var(--surface2);
-    border: 1px solid rgba(255,179,71,0.4);
-    border-radius: 20px;
-    padding: 4px 12px;
-    color: var(--warning);
-    font-family: 'Space Mono', monospace;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    animation: fadeIn 0.3s ease;
-  }
-  .swr-spinner {
-    width: 8px; height: 8px;
-    border: 1.5px solid rgba(255,179,71,0.3);
-    border-top-color: var(--warning);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    flex-shrink: 0;
-  }
+  .swr-badge { font-size: 10px; background: var(--surface2); border: 1px solid rgba(255,179,71,0.4); border-radius: 20px; padding: 4px 12px; color: var(--warning); font-family: 'Space Mono', monospace; display: flex; align-items: center; gap: 6px; animation: fadeIn 0.3s ease; }
+  .swr-spinner { width: 8px; height: 8px; border: 1.5px solid rgba(255,179,71,0.3); border-top-color: var(--warning); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
   body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--text); }
-
   .app { min-height: 100vh; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; }
-
-  .nav {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 0 28px; height: 60px;
-    background: var(--surface); border-bottom: 1px solid var(--border);
-    position: sticky; top: 0; z-index: 100;
-    width: 100%; box-sizing: border-box;
-  }
+  .nav { display: flex; align-items: center; justify-content: space-between; padding: 0 28px; height: 60px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100; width: 100%; box-sizing: border-box; }
   .nav-logo { font-family: 'Space Mono', monospace; font-size: 15px; color: var(--accent); letter-spacing: 2px; white-space: nowrap; }
   .nav-screens { display: flex; align-items: center; gap: 10px; flex-shrink: 1; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
   .screen-badge { font-size: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px; color: var(--text-dim); font-family: 'Space Mono', monospace; white-space: nowrap; }
   .screen-badge span { color: var(--success); }
-
   .admin { display: grid; grid-template-columns: 1fr 380px; gap: 24px; padding: 28px; max-width: 1400px; width: 100%; margin: 0 auto; box-sizing: border-box; }
-
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; box-sizing: border-box; width: 100%; }
   .panel-title { font-size: 13px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 20px; }
-
   .upload-zone { border: 2px dashed var(--border); border-radius: 12px; padding: 40px 24px; text-align: center; cursor: pointer; transition: all 0.2s; position: relative; }
   .upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: rgba(108,99,255,0.05); }
   .upload-zone.uploading-active { border-color: var(--accent); background: rgba(108,99,255,0.05); cursor: default; pointer-events: none; }
@@ -167,54 +113,26 @@ const style = `
   @keyframes uploadPulse { 0%,100% { transform: scale(1); opacity:1; } 50% { transform: scale(1.4); opacity:0.6; } }
   .upload-filename { font-size: 12px; color: var(--text-dim); font-family: 'Space Mono', monospace; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .upload-percent { font-size: 13px; font-family: 'Space Mono', monospace; color: var(--accent); font-weight: 700; flex-shrink: 0; }
-
   .media-list { display: flex; flex-direction: column; gap: 12px; margin-top: 8px; }
-  .media-item {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 14px 16px;
-    cursor: grab;
-    transition: all 0.25s ease;
-    position: relative;
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-  }
+  .media-item { display: flex; align-items: center; gap: 14px; background: var(--surface2); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; cursor: grab; transition: all 0.25s ease; position: relative; box-sizing: border-box; width: 100%; min-width: 0; }
   .media-item:hover { border-color: var(--accent); }
   .media-item.dragging { opacity: 0.4; }
   .media-item.drag-over { border-color: var(--accent2); background: rgba(255,101,132,0.05); }
-
   .drag-handle { color: var(--text-dim); font-size: 20px; cursor: grab; flex-shrink: 0; padding: 4px 6px; }
   .item-num { font-family: 'Space Mono', monospace; font-size: 11px; color: var(--text-dim); min-width: 18px; flex-shrink: 0; }
-
   .media-thumb { width: 64px; height: 48px; border-radius: 10px; object-fit: cover; flex-shrink: 0; background: var(--surface2); }
   .media-thumb-video { width: 64px; height: 48px; border-radius: 10px; flex-shrink: 0; background: var(--surface2); display: flex; align-items: center; justify-content: center; font-size: 22px; }
-
   .media-right { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
   .media-info { min-width: 0; }
   .media-name { font-size: 14.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .media-type { font-size: 11.5px; color: var(--text-dim); font-family: 'Space Mono', monospace; margin-top: 2px; }
-
+  .media-source { font-size: 10px; color: var(--accent); font-family: 'Space Mono', monospace; margin-top: 1px; }
   .media-duration { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-  .dur-btn {
-    width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text); cursor: pointer; font-size: 15px;
-    display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex-shrink: 0;
-  }
+  .dur-btn { width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex-shrink: 0; }
   .dur-btn:hover { border-color: var(--accent); color: var(--accent); }
   .dur-val { font-family: 'Space Mono', monospace; font-size: 14.5px; min-width: 42px; text-align: center; }
-
-  .del-btn {
-    width: 32px; height: 32px; border-radius: 8px; border: none;
-    background: transparent; color: var(--text-dim); cursor: pointer; font-size: 18px;
-    transition: all 0.2s; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-  }
+  .del-btn { width: 32px; height: 32px; border-radius: 8px; border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 18px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .del-btn:hover { background: rgba(255,95,126,0.15); color: var(--danger); }
-
   .setting-row { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--border); gap: 12px; }
   .setting-row:last-child { border-bottom: none; }
   .setting-label { font-size: 14px; }
@@ -224,26 +142,14 @@ const style = `
   .toggle::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: white; transition: left 0.2s; }
   .toggle.on::after { left: 23px; }
   .num-input { width: 70px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: 'Space Mono', monospace; font-size: 13px; padding: 6px 10px; text-align: center; flex-shrink: 0; }
-
   .btn-primary { width: 100%; padding: 13px; border-radius: 10px; border: none; background: linear-gradient(135deg, var(--accent), #8b5cf6); color: white; font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s; margin-top: 16px; box-sizing: border-box; }
   .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(108,99,255,0.3); }
   .btn-primary:active { transform: translateY(0); }
   .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-
-  /* KIOSK */
-  .kiosk-wrap {
-    position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
-    background: #000 !important; z-index: 99999 !important; overflow: hidden !important;
-    display: flex !important; align-items: center !important; justify-content: center !important;
-  }
-  .kiosk-wrap img, .kiosk-wrap video {
-    display: block !important; max-width: 100vw !important; max-height: 100vh !important;
-    width: auto !important; height: auto !important; flex-shrink: 1 !important;
-  }
-
+  .kiosk-wrap { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; background: #000 !important; z-index: 99999 !important; overflow: hidden !important; display: flex !important; align-items: center !important; justify-content: center !important; }
+  .kiosk-wrap img, .kiosk-wrap video { display: block !important; max-width: 100vw !important; max-height: 100vh !important; width: auto !important; height: auto !important; flex-shrink: 1 !important; }
   .toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 20px; font-size: 14px; z-index: 999999; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); animation: slideUp 0.3s ease; white-space: nowrap; }
   @keyframes slideUp { from { transform: translateX(-50%) translateY(20px); opacity: 0; } to { transform: translateX(-50%) translateY(0); opacity: 1; } }
-
   .empty { text-align: center; padding: 40px 20px; color: var(--text-dim); }
   .empty-icon { font-size: 40px; margin-bottom: 12px; }
   .demo-banner { background: rgba(255,179,71,0.1); border: 1px solid rgba(255,179,71,0.3); border-radius: 10px; padding: 10px 16px; margin-bottom: 20px; font-size: 13px; color: var(--warning); display: flex; align-items: center; gap: 8px; }
@@ -253,210 +159,69 @@ const style = `
   .realtime-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-  /* ==================== RESPONSIVE MOBILE ==================== */
-
   @media (max-width: 1024px) {
     .admin { grid-template-columns: 1fr; padding: 16px 12px; gap: 16px; }
   }
-
   @media (max-width: 768px) {
-
-    /* NAV */
     .nav { padding: 8px 12px; height: auto; min-height: 52px; flex-wrap: wrap; gap: 6px; }
     .nav-logo { font-size: 13px; }
     .nav-screens { gap: 5px; max-width: calc(100vw - 150px); }
     .screen-badge { font-size: 9px; padding: 3px 7px; }
     .swr-badge { font-size: 9px; padding: 3px 7px; }
-
-    /* ADMIN */
     .admin { padding: 10px; gap: 12px; }
-
-    /* PANEL — sin overflow:hidden para no cortar nada */
     .panel { padding: 14px 12px; border-radius: 14px; }
     .panel-title { font-size: 11px; margin-bottom: 12px; }
-
-    /* UPLOAD */
     .upload-zone { padding: 22px 12px; }
     .upload-icon { font-size: 26px; margin-bottom: 8px; }
     .upload-text { font-size: 13px; }
     .upload-sub { font-size: 10px; }
-
-    /* MEDIA ITEMS */
     .media-list { gap: 8px; }
-
-    .media-item {
-      padding: 10px 36px 10px 8px;
-      gap: 7px;
-    }
-
+    .media-item { padding: 10px 36px 10px 8px; gap: 7px; }
     .drag-handle { font-size: 15px; padding: 2px; }
     .item-num { font-size: 10px; min-width: 12px; }
-
-    .media-thumb,
-    .media-thumb-video {
-      width: 50px;
-      height: 50px;
-      border-radius: 9px;
-      font-size: 18px;
-    }
-
+    .media-thumb, .media-thumb-video { width: 50px; height: 50px; border-radius: 9px; font-size: 18px; }
     .media-right { gap: 5px; }
     .media-name { font-size: 12px; }
     .media-type { font-size: 9px; }
-
     .media-duration { gap: 5px; }
     .dur-btn { width: 28px; height: 28px; font-size: 13px; border-radius: 6px; }
     .dur-val { font-size: 12px; min-width: 28px; }
-
-    /* X en esquina con padding-right en el item para que no tape el contenido */
-    .del-btn {
-      position: absolute;
-      top: 50%; right: 8px;
-      transform: translateY(-50%);
-      width: 24px; height: 24px;
-      font-size: 13px;
-    }
-
-    /* SETTINGS */
+    .del-btn { position: absolute; top: 50%; right: 8px; transform: translateY(-50%); width: 24px; height: 24px; font-size: 13px; }
     .setting-row { padding: 10px 0; }
     .setting-label { font-size: 13px; }
     .setting-sub { font-size: 10px; }
     .num-input { width: 54px; font-size: 12px; padding: 5px 6px; }
-
-    /* SHORTCUTS */
     .shortcut-item { font-size: 11px; padding: 6px 0; gap: 8px; }
     .key { font-size: 10px; padding: 2px 5px; }
-
-    /* BOTÓN */
     .btn-primary { font-size: 14px; padding: 11px; margin-top: 12px; }
   }
-
-  /* LANDSCAPE móvil */
   @media (max-width: 900px) and (orientation: landscape) {
     .admin { grid-template-columns: 1fr 1fr; padding: 8px; gap: 8px; }
     .nav { min-height: 44px; padding: 6px 12px; }
   }
-  /* ==================== RESPONSIVE MOBILE OPTIMIZED (< 550px) ==================== */
-
-@media (max-width: 550px) {
-  /* Limpieza de contenedores principales */
-  .admin {
-    padding: 12px 8px;
-    gap: 16px;
-    grid-template-columns: 1fr; /* Forzamos una sola columna */
+  @media (max-width: 550px) {
+    .admin { padding: 12px 8px; gap: 16px; grid-template-columns: 1fr; }
+    .panel { padding: 16px 12px; border-radius: 12px; }
+    .nav { padding: 0 16px; height: 56px; }
+    .nav-logo { font-size: 13px; letter-spacing: 1px; }
+    .media-item { flex-wrap: wrap; padding: 12px; padding-right: 44px; gap: 8px; align-items: flex-start; }
+    .media-thumb, .media-thumb-video { width: 48px; height: 48px; border-radius: 8px; }
+    .media-right { flex: 1; min-width: 140px; }
+    .media-name { font-size: 13px; white-space: normal; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .media-duration { width: 100%; margin-top: 6px; justify-content: flex-start; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.05); }
+    .dur-btn { width: 30px; height: 30px; font-size: 14px; }
+    .dur-val { font-size: 12px; min-width: 36px; }
+    .setting-row { gap: 10px; }
+    .setting-label { font-size: 13px; }
+    .num-input { width: 55px; padding: 6px 4px; font-size: 12px; }
+    .btn-primary { padding: 14px; font-size: 14px; }
+    .toast { width: calc(100% - 32px); text-align: center; justify-content: center; }
   }
-
-  .panel {
-    padding: 16px 12px;
-    border-radius: 12px;
+  @media (max-width: 380px) {
+    .media-item { padding-right: 10px; }
+    .del-btn { position: static; margin-left: auto; transform: none; }
+    .media-duration { justify-content: space-between; }
   }
-
-  /* NAV: Más compacto ahora sin el módulo de pantallas */
-  .nav {
-    padding: 0 16px;
-    height: 56px;
-  }
-  
-  .nav-logo {
-    font-size: 13px;
-    letter-spacing: 1px;
-  }
-
-  /* MEDIA ITEM: Diseño flexible para evitar desbordamiento */
-  .media-item {
-    flex-wrap: wrap; /* Los controles bajan si no hay espacio */
-    padding: 12px;
-    padding-right: 44px; /* Espacio reservado para el botón eliminar */
-    gap: 8px;
-    align-items: flex-start;
-  }
-
-  .media-thumb, .media-thumb-video {
-    width: 48px;
-    height: 48px;
-    border-radius: 8px;
-  }
-
-  .media-right {
-    flex: 1;
-    min-width: 140px; /* Evita que el texto colapse */
-  }
-
-  .media-name {
-    font-size: 13px;
-    white-space: normal; /* Permite salto de línea si es necesario */
-    word-break: break-all;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  /* CONTROLES DE DURACIÓN: Posicionamiento inteligente */
-  .media-duration {
-    width: 100%; 
-    margin-top: 6px;
-    justify-content: flex-start;
-    padding-top: 8px;
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
-  }
-
-  .dur-btn {
-    width: 30px;
-    height: 30px;
-    font-size: 14px;
-  }
-
-  .dur-val {
-    font-size: 12px;
-    min-width: 36px;
-  }
-
-  /* SETTINGS: Ajuste de inputs numéricos */
-  .setting-row {
-    gap: 10px;
-  }
-
-  .setting-label {
-    font-size: 13px;
-  }
-
-  .num-input {
-    width: 55px;
-    padding: 6px 4px;
-    font-size: 12px;
-  }
-
-  /* BOTÓN PRINCIPAL */
-  .btn-primary {
-    padding: 14px;
-    font-size: 14px;
-  }
-
-  /* TOAST: Ajustado al ancho de pantalla */
-  .toast {
-    width: calc(100% - 32px);
-    text-align: center;
-    justify-content: center;
-  }
-}
-
-/* Ajuste para pantallas extremadamente pequeñas */
-@media (max-width: 380px) {
-  .media-item {
-    padding-right: 10px; /* Quitamos el padding extra */
-  }
-  
-  .del-btn {
-    position: static; /* El botón X vuelve al flujo normal */
-    margin-left: auto;
-    transform: none;
-  }
-  
-  .media-duration {
-    justify-content: space-between;
-  }
-}
 `;
 
 function Toast({ msg, icon = "✓" }) {
@@ -516,10 +281,8 @@ function KioskView({ items, onExit }) {
   const [showControls, setShowControls] = useState(false);
   const [speed2x, setSpeed2x] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-
   const [isLoading, setIsLoading] = useState(true);
   const initialLoadDone = useRef(false);
-
   const videoRef = useRef(null);
   const imgRef = useRef(null);
   const timerRef = useRef(null);
@@ -533,7 +296,6 @@ function KioskView({ items, onExit }) {
 
   const resolveUrl = (item) => {
     if (!item) return "";
-    if (item.type === "video") return item.url || "";
     return cachedUrls[item.url] || item.url || "";
   };
 
@@ -543,8 +305,6 @@ function KioskView({ items, onExit }) {
       const result = {};
       for (const item of items) {
         if (cancelled) break;
-        // FIX: saltamos videos
-        if (item.type === "video") continue;
         if (item.url?.startsWith("http")) {
           const local = await getCachedUrl(item.url);
           if (local !== item.url) blobUrlsRef.current.push(local);
@@ -672,10 +432,8 @@ function KioskView({ items, onExit }) {
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !isVideo) return;
-
     const onEnd = () => { setSpeed2x(false); nextRef.current?.(); };
     const onTime = () => { if (v.duration) setProgress((v.currentTime / v.duration) * 100); };
-
     v.addEventListener("ended", onEnd);
     v.addEventListener("timeupdate", onTime);
     return () => {
@@ -762,14 +520,8 @@ function KioskView({ items, onExit }) {
       e.preventDefault();
       const n = e.touches.length;
       gestureStartTouches = Array.from(e.touches).map(t => ({ x: t.clientX, y: t.clientY }));
-
-      if (n === 4) {
-        clearTimeout(longPressTimer);
-        gestureStartDist = avgDist4(e.touches);
-        return;
-      }
+      if (n === 4) { clearTimeout(longPressTimer); gestureStartDist = avgDist4(e.touches); return; }
       gestureStartDist = null;
-
       if (n === 2) {
         const zone = getZone(e.touches);
         longPressTimer = setTimeout(() => { speed2xActive = true; setSpeed2x(true); navigator.vibrate?.(60); }, 600);
@@ -777,7 +529,6 @@ function KioskView({ items, onExit }) {
         tapZone = zone;
         if (doubleTapTimer) clearTimeout(doubleTapTimer);
         doubleTapTimer = setTimeout(() => { tapCount = 0; tapZone = null; }, 400);
-
         if (tapCount === 2 && tapZone === zone) {
           tapCount = 0;
           clearTimeout(doubleTapTimer);
@@ -845,7 +596,6 @@ function KioskView({ items, onExit }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, width: "100vw", height: "100vh", background: "#000", zIndex: 99999, overflow: "hidden", margin: 0, padding: 0 }}>
-
       {isVideo ? (
         <video
           key={currentUrl}
@@ -869,65 +619,26 @@ function KioskView({ items, onExit }) {
       )}
 
       {isLoading && (
-        <div style={{
-          position: "absolute", inset: 0,
-          background: "#000",
-          display: "flex", flexDirection: "column",
-          alignItems: "center", justifyContent: "center",
-          gap: 20, zIndex: 50, pointerEvents: "none",
-        }}>
-          <div style={{
-            width: 56, height: 56,
-            border: "4px solid rgba(108,99,255,0.25)",
-            borderTopColor: "#6c63ff",
-            borderRadius: "50%",
-            animation: "kioskSpin 0.9s linear infinite",
-          }} />
-          <div style={{
-            color: "rgba(255,255,255,0.85)",
-            fontFamily: "'Space Mono', monospace",
-            fontSize: 15,
-            letterSpacing: "0.08em",
-          }}>Cargando presentación…</div>
-
-          <style>{`
-            @keyframes kioskSpin {
-              to { transform: rotate(360deg); }
-            }
-          `}</style>
+        <div style={{ position: "absolute", inset: 0, background: "#000", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 50, pointerEvents: "none" }}>
+          <div style={{ width: 56, height: 56, border: "4px solid rgba(108,99,255,0.25)", borderTopColor: "#6c63ff", borderRadius: "50%", animation: "kioskSpin 0.9s linear infinite" }} />
+          <div style={{ color: "rgba(255,255,255,0.85)", fontFamily: "'Space Mono', monospace", fontSize: 15, letterSpacing: "0.08em" }}>Cargando presentación…</div>
+          <style>{`@keyframes kioskSpin { to { transform: rotate(360deg); } }`}</style>
         </div>
       )}
 
       {speed2x && (
-        <div style={{
-          position: "absolute", top: 24, left: "50%", transform: "translateX(-50%)",
-          background: "rgba(108,99,255,0.85)", color: "#fff", borderRadius: 10,
-          padding: "8px 20px", fontFamily: "'Space Mono', monospace",
-          fontSize: 18, fontWeight: 700, zIndex: 10, pointerEvents: "none",
-          boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-        }}>⚡ ×2</div>
+        <div style={{ position: "absolute", top: 24, left: "50%", transform: "translateX(-50%)", background: "rgba(108,99,255,0.85)", color: "#fff", borderRadius: 10, padding: "8px 20px", fontFamily: "'Space Mono', monospace", fontSize: 18, fontWeight: 700, zIndex: 10, pointerEvents: "none", boxShadow: "0 4px 16px rgba(0,0,0,0.4)" }}>⚡ ×2</div>
       )}
 
       {showControls && (
-        <div style={{
-          position: "absolute", bottom: 28, left: "50%", transform: "translateX(-50%)",
-          background: "rgba(10,10,20,0.85)", border: "1px solid rgba(108,99,255,0.4)",
-          borderRadius: 16, padding: "16px 24px", zIndex: 20,
-          display: "flex", flexDirection: "column", gap: 14,
-          width: "min(480px, 90vw)", backdropFilter: "blur(12px)",
-          boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-        }}>
+        <div style={{ position: "absolute", bottom: 28, left: "50%", transform: "translateX(-50%)", background: "rgba(10,10,20,0.85)", border: "1px solid rgba(108,99,255,0.4)", borderRadius: 16, padding: "16px 24px", zIndex: 20, display: "flex", flexDirection: "column", gap: 14, width: "min(480px, 90vw)", backdropFilter: "blur(12px)", boxShadow: "0 8px 32px rgba(0,0,0,0.5)" }}>
           <div
             style={{ height: 8, background: "rgba(255,255,255,0.15)", borderRadius: 4, cursor: "pointer", position: "relative" }}
             onClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const pct = (e.clientX - rect.left) / rect.width;
               if (isVideo) seekTo(Math.max(0, Math.min(1, pct)));
-              else {
-                const dur = (current.duration || 5) * 1000;
-                pausedAtRef.current = dur * Math.max(0, Math.min(1, pct));
-                setProgress(pct * 100);
-              }
+              else { const dur = (current.duration || 5) * 1000; pausedAtRef.current = dur * Math.max(0, Math.min(1, pct)); setProgress(pct * 100); }
             }}
             onTouchEnd={(e) => {
               e.stopPropagation();
@@ -938,20 +649,10 @@ function KioskView({ items, onExit }) {
             }}
           >
             <div style={{ height: "100%", width: progress + "%", background: "linear-gradient(90deg,#6c63ff,#ff6584)", borderRadius: 4, transition: "width 0.1s linear" }} />
-            <div style={{
-              position: "absolute", top: "50%", left: progress + "%",
-              transform: "translate(-50%,-50%)",
-              width: 16, height: 16, borderRadius: "50%", background: "#fff",
-              boxShadow: "0 0 8px rgba(108,99,255,0.8)",
-            }} />
+            <div style={{ position: "absolute", top: "50%", left: progress + "%", transform: "translate(-50%,-50%)", width: 16, height: 16, borderRadius: "50%", background: "#fff", boxShadow: "0 0 8px rgba(108,99,255,0.8)" }} />
           </div>
-
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 20 }}>
-            <button
-              onClick={(e) => { e.stopPropagation(); if (isVideo && videoRef.current) videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10); }}
-              style={ctrlBtn}
-            >⏪ 10s</button>
-
+            <button onClick={(e) => { e.stopPropagation(); if (isVideo && videoRef.current) videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10); }} style={ctrlBtn}>⏪ 10s</button>
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -960,17 +661,9 @@ function KioskView({ items, onExit }) {
               }}
               style={{ ...ctrlBtn, fontSize: 22, width: 52, height: 52, borderRadius: "50%", background: "rgba(108,99,255,0.3)" }}
             >{paused ? "▶" : "⏸"}</button>
-
-            <button
-              onClick={(e) => { e.stopPropagation(); if (isVideo && videoRef.current) videoRef.current.currentTime = Math.min(videoRef.current.duration, videoRef.current.currentTime + 10); }}
-              style={ctrlBtn}
-            >10s ⏩</button>
+            <button onClick={(e) => { e.stopPropagation(); if (isVideo && videoRef.current) videoRef.current.currentTime = Math.min(videoRef.current.duration, videoRef.current.currentTime + 10); }} style={ctrlBtn}>10s ⏩</button>
           </div>
-
-          <button
-            onClick={(e) => { e.stopPropagation(); setShowControls(false); setPaused(false); if (isVideo) videoRef.current?.play(); }}
-            style={{ ...ctrlBtn, fontSize: 11, opacity: 0.6, alignSelf: "center" }}
-          >✕ Cerrar</button>
+          <button onClick={(e) => { e.stopPropagation(); setShowControls(false); setPaused(false); if (isVideo) videoRef.current?.play(); }} style={{ ...ctrlBtn, fontSize: 11, opacity: 0.6, alignSelf: "center" }}>✕ Cerrar</button>
         </div>
       )}
 
@@ -982,20 +675,10 @@ function KioskView({ items, onExit }) {
 }
 
 const ctrlBtn = {
-  background: "rgba(255,255,255,0.08)",
-  border: "1px solid rgba(255,255,255,0.15)",
-  color: "#fff",
-  borderRadius: 10,
-  padding: "8px 16px",
-  fontSize: 14,
-  cursor: "pointer",
-  fontFamily: "'DM Sans', sans-serif",
-  fontWeight: 500,
-  width: 80,
-  height: 44,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
+  background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)",
+  color: "#fff", borderRadius: 10, padding: "8px 16px", fontSize: 14, cursor: "pointer",
+  fontFamily: "'DM Sans', sans-serif", fontWeight: 500, width: 80, height: 44,
+  display: "flex", alignItems: "center", justifyContent: "center",
 };
 
 function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }) {
@@ -1007,8 +690,7 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
   const [draggingIdx, setDraggingIdx] = useState(null);
   const fileInputRef = useRef(null);
   const [toast, setToast] = useState(null);
-  const [compressing, setCompressing] = useState(false);
-  const [compressStatus, setCompressStatus] = useState("");
+
   const showToast = (msg, icon) => {
     setToast({ msg, icon });
     setTimeout(() => setToast(null), 3000);
@@ -1020,34 +702,36 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
     setUploading(true);
 
     for (let i = 0; i < files.length; i++) {
-      let file = files[i];
+      const file = files[i];
       const isImage = file.type.startsWith("image/");
       const isVideo = file.type.startsWith("video/");
       if (!isImage && !isVideo) continue;
-
-      //  Compresión automática si el video supera el límite 
-      if (isVideo && supabase && file.size > SUPABASE_MAX) {
-        setCompressing(true);
-        setCompressStatus("Preparando compresor...");
-        try {
-          const originalSize = (file.size / 1024 / 1024).toFixed(1);
-          file = await compressVideo(file, (msg) => setCompressStatus(msg));
-          const newSize = (file.size / 1024 / 1024).toFixed(1);
-          showToast(`Video comprimido: ${originalSize}MB → ${newSize}MB`, "⚡");
-        } catch (err) {
-          showToast(`Error al comprimir: ${err.message}`, "❌");
-          setCompressing(false);
-          continue;
-        } finally {
-          setCompressing(false);
-          setCompressStatus("");
-        }
-      }
 
       setUploadingFile(file.name);
       setUploadProgress(0);
       let url = URL.createObjectURL(file);
 
+      // ── Video grande → Cloudinary ──────────────────────────
+      if (isVideo && supabase && file.size > SUPABASE_MAX) {
+        try {
+          showToast("Video grande detectado, subiendo a Cloudinary...", "☁️");
+          url = await uploadToCloudinary(file, (pct) => setUploadProgress(pct));
+          setUploadProgress(100);
+          showToast("Video subido correctamente a Cloudinary", "✅");
+        } catch (err) {
+          showToast(`Error Cloudinary: ${err.message}`, "❌");
+          setUploading(false);
+          continue;
+        }
+        setItems(prev => [...prev, {
+          id: generateId(), type: "video", url,
+          title: file.name, duration: settings.defaultDuration || 5,
+          order: prev.length, storage: "cloudinary",
+        }]);
+        continue;
+      }
+
+      // ── Todo lo demás → Supabase ───────────────────────────
       if (supabase) {
         try {
           const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -1062,7 +746,7 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
           );
           clearInterval(progressInterval);
           if (error) {
-            showToast(`Error: ${error.message}`, "❌");
+            showToast(`Error Supabase: ${error.message}`, "❌");
           } else {
             setUploadProgress(100);
             const { data: pub } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
@@ -1079,19 +763,15 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
       }
 
       setItems(prev => [...prev, {
-        id: generateId(),
-        type: isImage ? "image" : "video",
-        url,
-        title: file.name,
-        duration: settings.defaultDuration || 5,
-        order: items.length + i,
+        id: generateId(), type: isImage ? "image" : "video",
+        url, title: file.name, duration: settings.defaultDuration || 5,
+        order: prev.length, storage: "supabase",
       }]);
     }
 
     setUploading(false);
     setUploadProgress(0);
     setUploadingFile("");
-    showToast(`${files.length} archivo(s) subido(s)`, "✅");
   };
 
   const updateDuration = (id, delta) => {
@@ -1100,16 +780,29 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
 
   const removeItem = async (id) => {
     const item = items.find(it => it.id === id);
+
+    // Borrar de Supabase Storage
     if (supabase && item?.url?.includes(SUPABASE_URL)) {
       try {
         const parts = item.url.split(`/storage/v1/object/public/${STORAGE_BUCKET}/`);
-        if (parts[1]) {
-          await supabase.storage.from(STORAGE_BUCKET).remove([parts[1]]);
-        }
+        if (parts[1]) await supabase.storage.from(STORAGE_BUCKET).remove([parts[1]]);
       } catch (err) {
-        console.error("Error eliminando archivo:", err);
+        console.error("Error eliminando de Supabase:", err);
       }
     }
+
+    // Borrar de Cloudinary via Edge Function
+    if (item?.url?.includes("cloudinary.com")) {
+      try {
+        await deleteFromCloudinary(item.url);
+      } catch (err) {
+        console.error("Error eliminando de Cloudinary:", err);
+      }
+    }
+
+    // Borrar del caché local
+    await removeCachedUrl(item?.url);
+
     setItems(prev => prev.filter(it => it.id !== id));
     showToast("Eliminado", "🗑");
   };
@@ -1139,36 +832,10 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
             onDragLeave={() => setDrag(false)}
             onDrop={(e) => { e.preventDefault(); setDrag(false); handleFiles([...e.dataTransfer.files]); }}
-            onClick={() => !uploading && !compressing && fileInputRef.current?.click()}
+            onClick={() => !uploading && fileInputRef.current?.click()}
             style={{ position: "relative" }}
           >
             <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={(e) => handleFiles([...e.target.files])} />
-
-            {/* ── Overlay compresión ── */}
-            {compressing && (
-              <div style={{
-                position: "absolute", inset: 0, borderRadius: 12,
-                background: "rgba(10,10,20,0.93)",
-                display: "flex", flexDirection: "column",
-                alignItems: "center", justifyContent: "center", gap: 14,
-                zIndex: 10,
-              }}>
-                <div style={{
-                  width: 44, height: 44,
-                  border: "3px solid rgba(108,99,255,0.3)",
-                  borderTopColor: "var(--accent)",
-                  borderRadius: "50%",
-                  animation: "spin 0.8s linear infinite",
-                }} />
-                <div style={{ color: "var(--accent)", fontFamily: "'Space Mono',monospace", fontSize: 13, textAlign: "center", padding: "0 16px" }}>
-                  ⚡ {compressStatus}
-                </div>
-                <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
-                  Esto puede tardar 1-2 minutos según el video
-                </div>
-              </div>
-            )}
-
             {uploading ? (
               <>
                 <div className="upload-icon">{uploadingFile.match(/\.(mp4|mov|avi|webm)$/i) ? "🎬" : "🖼️"}</div>
@@ -1218,17 +885,19 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
                 >
                   <span className="drag-handle">⋮⋮</span>
                   <span className="item-num">{i + 1}</span>
-
                   {item.type === "image" ? (
                     <img className="media-thumb" src={item.url} alt={item.title} />
                   ) : (
                     <div className="media-thumb-video">🎬</div>
                   )}
-
                   <div className="media-right">
                     <div className="media-info">
                       <div className="media-name">{item.title}</div>
                       <div className="media-type">{item.type === "image" ? "IMAGEN" : "VIDEO"}</div>
+                      {/* Indicador de origen */}
+                      {item.storage === "cloudinary" && (
+                        <div className="media-source">☁️ Cloudinary</div>
+                      )}
                     </div>
                     {item.type === "image" && (
                       <div className="media-duration">
@@ -1238,7 +907,6 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
                       </div>
                     )}
                   </div>
-
                   <button className="del-btn" onClick={(e) => { e.stopPropagation(); removeItem(item.id); }}>✕</button>
                 </div>
               ))}
@@ -1266,7 +934,7 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
 
         <div className="panel">
           <div className="panel-title">⌨️ Atajos de Teclado</div>
-          {[["L", "Ir al primer elemento"], ["→ ←", "Siguiente / Anterior"], ["F", "Pantalla completa"], ["ESC", "Salir de la pantalla completa"]].map(([key, desc]) => (
+          {[["L", "Ir al primer elemento"], ["→ ←", "Siguiente / Anterior"], ["F", "Pantalla completa"], ["ESC", "Salir del kiosk"]].map(([key, desc]) => (
             <div key={key} className="shortcut-item">
               <span className="key">{key}</span>
               <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{desc}</span>
@@ -1289,6 +957,7 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
     </div>
   );
 }
+
 export default function App() {
   const [view, setView] = useState(() => window.location.hash === "#kiosk" ? "kiosk" : "admin");
 
@@ -1301,30 +970,22 @@ export default function App() {
     const handleOrientation = async () => {
       if (screen.orientation && screen.orientation.lock) {
         try {
-          if (window.location.hash === '#kiosk') {
-            await screen.orientation.lock('landscape');
-          } else {
-            await screen.orientation.lock('portrait');
-          }
+          if (window.location.hash === '#kiosk') await screen.orientation.lock('landscape');
+          else await screen.orientation.lock('portrait');
         } catch (error) {
-          console.warn("El bloqueo de orientación fue rechazado o no es compatible:", error);
+          console.warn("Bloqueo de orientación no compatible:", error);
         }
       }
     };
-
     handleOrientation();
     window.addEventListener('hashchange', handleOrientation);
     return () => window.removeEventListener('hashchange', handleOrientation);
   }, []);
 
-  // Estado inicial: leer desde localStorage SINCRÓNICAMENTE 
   const cachedData = readCache();
   const [items, setItems] = useState(cachedData?.items ?? []);
   const [settings, setSettings] = useState(cachedData?.settings ?? {
-    loop: true,
-    fade: true,
-    defaultDuration: 5,
-    activeScreens: [0],
+    loop: true, fade: true, defaultDuration: 5, activeScreens: [0],
   });
   const [loaded, setLoaded] = useState(!!cachedData);
   const [revalidating, setRevalidating] = useState(false);
@@ -1338,49 +999,35 @@ export default function App() {
   useEffect(() => { itemsRef.current = items; }, [items]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // Persistir en localStorage cuando cambien items o settings 
   useEffect(() => {
     if (!loaded) return;
     writeCache(items, settings, localVersionRef.current);
   }, [items, settings, loaded]);
 
-  // SWR: revalidar Supabase en background 
   useEffect(() => {
     if (!supabase) { setLoaded(true); setTimeout(() => { userChangedRef.current = true; }, 500); return; }
-
     const revalidate = async () => {
       setRevalidating(true);
       try {
         const { data, error } = await supabase
-          .from("ad_playlists")
-          .select("id, updated_at, items, settings")
-          .eq("id", "main")
-          .single();
-
+          .from("ad_playlists").select("id, updated_at, items, settings").eq("id", "main").single();
         if (error || !data) return;
-
         const serverVersion = data.updated_at ?? null;
         const myVersion = localVersionRef.current;
-
-        // Solo actualizamos si el servidor tiene datos más nuevos
-        const serverIsNewer =
-          !myVersion ||
-          (serverVersion && new Date(serverVersion) > new Date(myVersion));
-
+        const serverIsNewer = !myVersion || (serverVersion && new Date(serverVersion) > new Date(myVersion));
         if (serverIsNewer) {
           if (data.items) setItems(data.items);
           if (data.settings) setSettings(data.settings);
           localVersionRef.current = serverVersion;
         }
       } catch (e) {
-        console.warn("SWR revalidation failed, using cache:", e);
+        console.warn("SWR revalidation failed, usando caché:", e);
       } finally {
         setRevalidating(false);
         setLoaded(true);
         setTimeout(() => { userChangedRef.current = true; }, 500);
       }
     };
-
     revalidate();
   }, []);
 
@@ -1388,90 +1035,50 @@ export default function App() {
     if (!supabase || !loaded) return;
     if (items.length === 0 && !localVersionRef.current) return;
     if (!userChangedRef.current) return;
-
     setSaving(true);
     if (pendingSaveRef.current) clearTimeout(pendingSaveRef.current);
-
     pendingSaveRef.current = setTimeout(async () => {
       isSavingRef.current = true;
-
       const now = new Date().toISOString();
       const { error } = await supabase.from("ad_playlists").upsert({
-        id: "main",
-        items: itemsRef.current,
-        settings: settingsRef.current,
-        updated_at: now,
+        id: "main", items: itemsRef.current, settings: settingsRef.current, updated_at: now,
       });
-
-      if (!error) {
-        localVersionRef.current = now;
-        writeCache(itemsRef.current, settingsRef.current, now);
-      }
-
+      if (!error) { localVersionRef.current = now; writeCache(itemsRef.current, settingsRef.current, now); }
       setSaving(false);
       setTimeout(() => { isSavingRef.current = false; }, 3000);
     }, 800);
-
     return () => { if (pendingSaveRef.current) clearTimeout(pendingSaveRef.current); };
   }, [items, settings, loaded]);
 
   useEffect(() => {
     if (!supabase) return;
-
-    let channel = null;
-    let reconnectTimer = null;
-    let isUnmounted = false;
-
+    let channel = null, reconnectTimer = null, isUnmounted = false;
     const subscribe = () => {
-      if (channel) {
-        supabase.removeChannel(channel);
-        channel = null;
-      }
-
+      if (channel) { supabase.removeChannel(channel); channel = null; }
       channel = supabase
         .channel(`playlist-changes-${Date.now()}`)
-        .on(
-          "postgres_changes",
-          { event: "*", schema: "public", table: "ad_playlists", filter: "id=eq.main" },
-          (payload) => {
-            if (!payload.new) return;
-            if (isSavingRef.current) return;
-
-            const serverVersion = payload.new.updated_at;
-            const myVersion = localVersionRef.current;
-            if (myVersion && serverVersion <= myVersion) return;
-
-            setItems(prev => {
-              syncCache(payload.new.items || [], prev);
-              return payload.new.items || [];
-            });
-            setSettings(payload.new.settings || {});
-            localVersionRef.current = serverVersion;
-          }
-        )
+        .on("postgres_changes", { event: "*", schema: "public", table: "ad_playlists", filter: "id=eq.main" }, (payload) => {
+          if (!payload.new || isSavingRef.current) return;
+          const serverVersion = payload.new.updated_at;
+          const myVersion = localVersionRef.current;
+          if (myVersion && serverVersion <= myVersion) return;
+          setItems(prev => { syncCache(payload.new.items || [], prev); return payload.new.items || []; });
+          setSettings(payload.new.settings || {});
+          localVersionRef.current = serverVersion;
+        })
         .subscribe((status) => {
           if (isUnmounted) return;
-          if (status === "SUBSCRIBED") {
-            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-          }
-          if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-            reconnectTimer = setTimeout(() => {
-              if (!isUnmounted) subscribe();
-            }, 3000);
+          if (status === "SUBSCRIBED") { if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } }
+          if (["CLOSED", "CHANNEL_ERROR", "TIMED_OUT"].includes(status)) {
+            reconnectTimer = setTimeout(() => { if (!isUnmounted) subscribe(); }, 3000);
           }
         });
     };
-
     subscribe();
-
     const handleOnline = () => subscribe();
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") subscribe();
-    };
-
+    const handleVisibility = () => { if (document.visibilityState === "visible") subscribe(); };
     window.addEventListener("online", handleOnline);
     document.addEventListener("visibilitychange", handleVisibility);
-
     return () => {
       isUnmounted = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -1485,10 +1092,7 @@ export default function App() {
     return (
       <>
         <style>{style}</style>
-        <KioskView
-          items={[...items].sort((a, b) => a.order - b.order)}
-          onExit={() => changeView("admin")}
-        />
+        <KioskView items={[...items].sort((a, b) => a.order - b.order)} onExit={() => changeView("admin")} />
       </>
     );
   }
@@ -1499,7 +1103,6 @@ export default function App() {
       <nav className="nav">
         <div className="nav-logo">San Francisco</div>
         <div className="nav-screens">
-          {/* Indicador SWR: solo visible mientras revalida en background */}
           {revalidating && (
             <div className="swr-badge">
               <div className="swr-spinner" />
@@ -1515,12 +1118,9 @@ export default function App() {
         </div>
       </nav>
       <AdminPanel
-        items={items}
-        setItems={setItems}
-        settings={settings}
-        setSettings={setSettings}
-        onLaunch={() => changeView("kiosk")}
-        saving={saving}
+        items={items} setItems={setItems}
+        settings={settings} setSettings={setSettings}
+        onLaunch={() => changeView("kiosk")} saving={saving}
       />
     </div>
   );
