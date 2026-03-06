@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -15,6 +17,61 @@ function readCache() {
   } catch {
     return null;
   }
+}
+const ffmpeg = new FFmpeg();
+let ffmpegLoaded = false;
+
+async function loadFFmpeg(onProgress) {
+  if (ffmpegLoaded) return;
+  onProgress?.("Cargando compresor...");
+  await ffmpeg.load({
+    coreURL: await toBlobURL(
+      'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+      'text/javascript'
+    ),
+    wasmURL: await toBlobURL(
+      'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+      'application/wasm'
+    ),
+  });
+  ffmpegLoaded = true;
+}
+
+// Límite en bytes (45 MB con margen de seguridad)
+const SUPABASE_MAX = 45 * 1024 * 1024;
+
+async function compressVideo(file, onProgress) {
+  await loadFFmpeg(onProgress);
+
+  onProgress?.("Comprimiendo video...");
+
+  ffmpeg.on('progress', ({ progress }) => {
+    onProgress?.(`Comprimiendo... ${Math.round(progress * 100)}%`);
+  });
+
+  await ffmpeg.writeFile('input.mp4', await fetchFile(file));
+
+  await ffmpeg.exec([
+    '-i', 'input.mp4',
+    '-vcodec', 'libx264',
+    '-crf', '28',
+    '-preset', 'fast',
+    '-vf', 'scale=-2:720',
+    '-acodec', 'aac',
+    '-b:a', '128k',
+    '-movflags', '+faststart',
+    'output.mp4'
+  ]);
+
+  const data = await ffmpeg.readFile('output.mp4');
+  await ffmpeg.deleteFile('input.mp4');
+  await ffmpeg.deleteFile('output.mp4');
+
+  return new File(
+    [new Blob([data.buffer], { type: 'video/mp4' })],
+    file.name.replace(/\.[^.]+$/, '_compressed.mp4'),
+    { type: 'video/mp4' }
+  );
 }
 
 function writeCache(items, settings, version) {
@@ -950,7 +1007,8 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
   const [draggingIdx, setDraggingIdx] = useState(null);
   const fileInputRef = useRef(null);
   const [toast, setToast] = useState(null);
-
+  const [compressing, setCompressing] = useState(false);
+  const [compressStatus, setCompressStatus] = useState("");
   const showToast = (msg, icon) => {
     setToast({ msg, icon });
     setTimeout(() => setToast(null), 3000);
@@ -962,10 +1020,29 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
     setUploading(true);
 
     for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+      let file = files[i];
       const isImage = file.type.startsWith("image/");
       const isVideo = file.type.startsWith("video/");
       if (!isImage && !isVideo) continue;
+
+      //  Compresión automática si el video supera el límite 
+      if (isVideo && supabase && file.size > SUPABASE_MAX) {
+        setCompressing(true);
+        setCompressStatus("Preparando compresor...");
+        try {
+          const originalSize = (file.size / 1024 / 1024).toFixed(1);
+          file = await compressVideo(file, (msg) => setCompressStatus(msg));
+          const newSize = (file.size / 1024 / 1024).toFixed(1);
+          showToast(`Video comprimido: ${originalSize}MB → ${newSize}MB`, "⚡");
+        } catch (err) {
+          showToast(`Error al comprimir: ${err.message}`, "❌");
+          setCompressing(false);
+          continue;
+        } finally {
+          setCompressing(false);
+          setCompressStatus("");
+        }
+      }
 
       setUploadingFile(file.name);
       setUploadProgress(0);
@@ -980,7 +1057,9 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
             fakeProgress = Math.min(fakeProgress + Math.random() * 8, 90);
             setUploadProgress(Math.round(fakeProgress));
           }, 300);
-          const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, file, { upsert: false, contentType: file.type });
+          const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(
+            path, file, { upsert: false, contentType: file.type }
+          );
           clearInterval(progressInterval);
           if (error) {
             showToast(`Error: ${error.message}`, "❌");
@@ -1060,9 +1139,36 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
             onDragLeave={() => setDrag(false)}
             onDrop={(e) => { e.preventDefault(); setDrag(false); handleFiles([...e.dataTransfer.files]); }}
-            onClick={() => !uploading && fileInputRef.current?.click()}
+            onClick={() => !uploading && !compressing && fileInputRef.current?.click()}
+            style={{ position: "relative" }}
           >
             <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={(e) => handleFiles([...e.target.files])} />
+
+            {/* ── Overlay compresión ── */}
+            {compressing && (
+              <div style={{
+                position: "absolute", inset: 0, borderRadius: 12,
+                background: "rgba(10,10,20,0.93)",
+                display: "flex", flexDirection: "column",
+                alignItems: "center", justifyContent: "center", gap: 14,
+                zIndex: 10,
+              }}>
+                <div style={{
+                  width: 44, height: 44,
+                  border: "3px solid rgba(108,99,255,0.3)",
+                  borderTopColor: "var(--accent)",
+                  borderRadius: "50%",
+                  animation: "spin 0.8s linear infinite",
+                }} />
+                <div style={{ color: "var(--accent)", fontFamily: "'Space Mono',monospace", fontSize: 13, textAlign: "center", padding: "0 16px" }}>
+                  ⚡ {compressStatus}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
+                  Esto puede tardar 1-2 minutos según el video
+                </div>
+              </div>
+            )}
+
             {uploading ? (
               <>
                 <div className="upload-icon">{uploadingFile.match(/\.(mp4|mov|avi|webm)$/i) ? "🎬" : "🖼️"}</div>
@@ -1087,7 +1193,6 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
           </div>
         </div>
 
-        {/* overflow:hidden evita que los items se salgan en móvil */}
         <div className="panel">
           <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span>🗂 Orden del Carrusel</span>
@@ -1111,20 +1216,15 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
                   onDrop={() => onDrop(i)}
                   onDragEnd={() => { setDraggingIdx(null); setDragOverIdx(null); }}
                 >
-                  {/* Columna 1: handle drag */}
                   <span className="drag-handle">⋮⋮</span>
-
-                  {/* Columna 2: número */}
                   <span className="item-num">{i + 1}</span>
 
-                  {/* Columna 3: thumbnail */}
                   {item.type === "image" ? (
                     <img className="media-thumb" src={item.url} alt={item.title} />
                   ) : (
                     <div className="media-thumb-video">🎬</div>
                   )}
 
-                  {/* Columna 4: info + duración (apilados) */}
                   <div className="media-right">
                     <div className="media-info">
                       <div className="media-name">{item.title}</div>
@@ -1132,24 +1232,14 @@ function AdminPanel({ items, setItems, settings, setSettings, onLaunch, saving }
                     </div>
                     {item.type === "image" && (
                       <div className="media-duration">
-                        <button
-                          className="dur-btn"
-                          onClick={(e) => { e.stopPropagation(); updateDuration(item.id, -1); }}
-                        >−</button>
+                        <button className="dur-btn" onClick={(e) => { e.stopPropagation(); updateDuration(item.id, -1); }}>−</button>
                         <span className="dur-val">{item.duration || 5}s</span>
-                        <button
-                          className="dur-btn"
-                          onClick={(e) => { e.stopPropagation(); updateDuration(item.id, 1); }}
-                        >+</button>
+                        <button className="dur-btn" onClick={(e) => { e.stopPropagation(); updateDuration(item.id, 1); }}>+</button>
                       </div>
                     )}
                   </div>
 
-                  {/* Botón eliminar — siempre absoluto */}
-                  <button
-                    className="del-btn"
-                    onClick={(e) => { e.stopPropagation(); removeItem(item.id); }}
-                  >✕</button>
+                  <button className="del-btn" onClick={(e) => { e.stopPropagation(); removeItem(item.id); }}>✕</button>
                 </div>
               ))}
             </div>
@@ -1227,7 +1317,7 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleOrientation);
   }, []);
 
-  // ─── Estado inicial: leer desde localStorage SINCRÓNICAMENTE ──────────
+  // Estado inicial: leer desde localStorage SINCRÓNICAMENTE 
   const cachedData = readCache();
   const [items, setItems] = useState(cachedData?.items ?? []);
   const [settings, setSettings] = useState(cachedData?.settings ?? {
@@ -1248,13 +1338,13 @@ export default function App() {
   useEffect(() => { itemsRef.current = items; }, [items]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // ─── Persistir en localStorage cuando cambien items o settings ────────
+  // Persistir en localStorage cuando cambien items o settings 
   useEffect(() => {
     if (!loaded) return;
     writeCache(items, settings, localVersionRef.current);
   }, [items, settings, loaded]);
 
-  // ─── SWR: revalidar Supabase en background ────────────────────────────
+  // SWR: revalidar Supabase en background 
   useEffect(() => {
     if (!supabase) { setLoaded(true); setTimeout(() => { userChangedRef.current = true; }, 500); return; }
 
@@ -1325,34 +1415,70 @@ export default function App() {
     return () => { if (pendingSaveRef.current) clearTimeout(pendingSaveRef.current); };
   }, [items, settings, loaded]);
 
-  // ─── Realtime: actualizaciones de otros clientes ──────────────────────
   useEffect(() => {
     if (!supabase) return;
 
-    const channel = supabase
-      .channel("playlist-changes")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "ad_playlists", filter: "id=eq.main" },
-        (payload) => {
-          if (!payload.new) return;
-          if (isSavingRef.current) return;
+    let channel = null;
+    let reconnectTimer = null;
+    let isUnmounted = false;
 
-          const serverVersion = payload.new.updated_at;
-          const myVersion = localVersionRef.current;
-          if (myVersion && serverVersion <= myVersion) return;
+    const subscribe = () => {
+      if (channel) {
+        supabase.removeChannel(channel);
+        channel = null;
+      }
 
-          setItems(prev => {
-            syncCache(payload.new.items || [], prev);
-            return payload.new.items || [];
-          });
-          setSettings(payload.new.settings || {});
-          localVersionRef.current = serverVersion;
-        }
-      )
-      .subscribe();
+      channel = supabase
+        .channel(`playlist-changes-${Date.now()}`)
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "ad_playlists", filter: "id=eq.main" },
+          (payload) => {
+            if (!payload.new) return;
+            if (isSavingRef.current) return;
 
-    return () => { supabase.removeChannel(channel); };
+            const serverVersion = payload.new.updated_at;
+            const myVersion = localVersionRef.current;
+            if (myVersion && serverVersion <= myVersion) return;
+
+            setItems(prev => {
+              syncCache(payload.new.items || [], prev);
+              return payload.new.items || [];
+            });
+            setSettings(payload.new.settings || {});
+            localVersionRef.current = serverVersion;
+          }
+        )
+        .subscribe((status) => {
+          if (isUnmounted) return;
+          if (status === "SUBSCRIBED") {
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          }
+          if (status === "CLOSED" || status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+            reconnectTimer = setTimeout(() => {
+              if (!isUnmounted) subscribe();
+            }, 3000);
+          }
+        });
+    };
+
+    subscribe();
+
+    const handleOnline = () => subscribe();
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") subscribe();
+    };
+
+    window.addEventListener("online", handleOnline);
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      isUnmounted = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (channel) supabase.removeChannel(channel);
+      window.removeEventListener("online", handleOnline);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, []);
 
   if (view === "kiosk") {
