@@ -8,7 +8,7 @@ const STORAGE_BUCKET = "media";
 const CLOUDINARY_CLOUD = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_PRESET = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
 const SUPABASE_MAX = 45 * 1024 * 1024;
-
+console.log(import.meta.env.VITE_CLOUDINARY_CLOUD_NAME);
 const LS_KEY = "adkiosk_cache";
 
 function readCache() {
