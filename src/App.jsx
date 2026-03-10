@@ -639,7 +639,6 @@ function KioskView({ items, onExit }) {
           ref={(el) => { videoRef.current = el; forceSize(el); }}
           src={currentUrl}
           autoPlay
-          muted
           playsInline
           preload="auto"
           onLoadedMetadata={onMediaLoad}
